@@ -5730,6 +5730,12 @@ void video_driver_build_info(video_frame_info_t *video_info)
    video_info->bfi_dark_frames             = settings->uints.video_bfi_dark_frames;
    video_info->shader_subframes            = video_st->headset_interval
       ? 1 : settings->uints.video_shader_subframes;
+   video_info->shader_subframe_period_ns   = settings->bools.vrr_runloop_enable
+         && video_info->shader_subframes > 1
+         && video_st->av_info.timing.fps > 0.0
+         ? (int64_t)(1000000000.0 /
+            (video_st->av_info.timing.fps * video_info->shader_subframes))
+         : 0;
    video_info->headset_distance            = settings->floats.video_openxr_distance;
    video_info->headset_width               = settings->floats.video_openxr_width;
    video_info->headset_placement           = settings->uints.video_openxr_placement;

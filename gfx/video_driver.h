@@ -490,6 +490,7 @@ typedef struct video_frame_info
     * Owned by whichever thread presents: video_driver_frame() on the
     * direct path, the video thread under the threaded wrapper. */
    uint64_t swap_count;
+   int64_t shader_subframe_period_ns;
    void *userdata;
    void *widgets_userdata;
    void *disp_userdata;

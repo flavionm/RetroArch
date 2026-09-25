@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include <retro_assert.h>
+#include <features/features_cpu.h>
 #include <encodings/utf.h>
 #include <compat/strl.h>
 #include <gfx/scaler/scaler.h>
@@ -8097,6 +8098,27 @@ static void vulkan_run_hdr_pipeline(VkPipeline pipeline, VkRenderPass render_pas
    vk->hdr.ubo_values.paper_white_nits    = prev_paper_white_nits;
 }
 
+static void vulkan_wait_shader_subframe(int64_t *deadline_ns,
+      int64_t period_ns)
+{
+   retro_time_t now_us;
+   int64_t now_ns;
+
+   if (period_ns <= 0)
+      return;
+
+   now_us = cpu_features_get_time_usec();
+   now_ns = (int64_t)now_us * 1000;
+
+   if (     *deadline_ns <= 0
+         || now_ns - *deadline_ns >= period_ns)
+      *deadline_ns = now_ns;
+
+   *deadline_ns += period_ns;
+   if (now_ns < *deadline_ns)
+      retro_sleep_until_us((retro_time_t)((*deadline_ns + 999) / 1000));
+}
+
 static bool vulkan_frame(void *data, const void *frame,
       unsigned dims,
       uint64_t frame_count,
@@ -8110,6 +8132,8 @@ static bool vulkan_frame(void *data, const void *frame,
    VkRenderPassBeginInfo rp_info;
    VkCommandBufferBeginInfo begin_info;
    VkSemaphore signal_semaphores[2];
+   int64_t shader_subframe_deadline_ns           = 0;
+   retro_time_t start                            = cpu_features_get_time_usec();
    vk_t *vk                                      = (vk_t*)data;
    vulkan_filter_chain_t *filter_chain           = NULL;
    bool waits_for_semaphores                     = false;
@@ -9281,8 +9305,11 @@ static bool vulkan_frame(void *data, const void *frame,
          &&  (!(vk->context->flags & VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK)))
    {
       vk->context->flags |= VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK;
+      shader_subframe_deadline_ns = (int64_t)start * 1000;
       for (j = 1; j < (int) video_info->shader_subframes; j++)
       {
+         vulkan_wait_shader_subframe(&shader_subframe_deadline_ns,
++               video_info->shader_subframe_period_ns);
          vulkan_filter_chain_set_shader_subframes(
                (vulkan_filter_chain_t*)filter_chain, video_info->shader_subframes);
          vulkan_filter_chain_set_current_shader_subframe(

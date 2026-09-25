@@ -4974,6 +4974,12 @@ void video_driver_build_info(video_frame_info_t *video_info)
    video_info->black_frame_insertion       = settings->uints.video_black_frame_insertion;
    video_info->bfi_dark_frames             = settings->uints.video_bfi_dark_frames;
    video_info->shader_subframes            = settings->uints.video_shader_subframes;
+   video_info->shader_subframe_period_ns   = 0;
+   if (     settings->bools.vrr_runloop_enable
+         && video_info->shader_subframes > 1
+         && video_st->av_info.timing.fps > 0.0)
+      video_info->shader_subframe_period_ns = (int64_t)(1000000000.0 /
+            (video_st->av_info.timing.fps * video_info->shader_subframes));
    video_info->current_subframe            = 0;
 #ifdef HAVE_THREADS
    /* The video thread owns and stamps this under the wrapper. */

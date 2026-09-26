@@ -328,8 +328,37 @@ typedef struct gfx_ctx_vulkan_data
     * carries a present ID and the driver reports when it actually
     * reached the display, on the platform's monotonic clock. */
    PFN_vkVoidFunction display_timing_query;
+   PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR get_surface_capabilities2;
    uint32_t present_id;
    bool display_timing_supported;
+#ifdef VK_EXT_present_timing
+   bool present_timing_surface_supported;
+   VkPresentStageFlagsEXT present_timing_stage_queries;
+   VkSwapchainTimingPropertiesEXT present_timing_properties;
+   bool present_timing_properties_valid;
+   uint64_t present_timing_properties_counter;
+#endif
+#ifdef VK_EXT_present_timing
+   bool present_timing_supported;
+   PFN_vkSetSwapchainPresentTimingQueueSizeEXT present_timing_queue_size;
+   PFN_vkGetSwapchainTimingPropertiesEXT get_timing_properties;
+   PFN_vkGetSwapchainTimeDomainPropertiesEXT get_time_domains;
+   PFN_vkGetPastPresentationTimingEXT get_past_timing;
+   uint32_t present_timing_queue_capacity;
+   uint32_t present_timing_pending;
+   VkTimeDomainKHR present_timing_time_domain;
+   uint64_t present_timing_time_domain_id;
+   bool present_timing_relative;
+   uint64_t present_timing_target_time;
+   bool present_timing_calibrated;
+   bool present_timing_target_valid;
+   bool present_timing_payload_logged;
+   bool present_timing_last_verified;
+   uint64_t present_timing_last_present_id;
+   uint64_t present_timing_last_target_time;
+   uint64_t present_timing_last_actual_time;
+   int64_t present_timing_last_error_ns;
+#endif
 #ifdef VULKAN_HDR_SWAPCHAIN
    /* Loaded from VK_EXT_hdr_metadata when that optional device extension is
     * present; NULL otherwise. Used to signal SMPTE-2086 mastering-display
@@ -427,6 +456,9 @@ bool vulkan_surface_destroy(gfx_ctx_vulkan_data_t *vk);
 void vulkan_present(gfx_ctx_vulkan_data_t *vk, unsigned index);
 
 retro_time_t vulkan_last_present_time(gfx_ctx_vulkan_data_t *vk);
+#ifdef VK_EXT_present_timing
+retro_time_t vulkan_present_timing_last_time(gfx_ctx_vulkan_data_t *vk);
+#endif
 
 /* The context driver hands the video driver &data->vk.context and keeps
  * the swapchain beside it; every context embeds gfx_ctx_vulkan_data_t

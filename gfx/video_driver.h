@@ -1173,6 +1173,16 @@ typedef struct
    /* Where the most recent frame-time sample came from: the display's
     * reported present times (true) or the frame loop (false). Stats. */
    bool frame_time_from_display;
+   bool present_timing_supported;
+   bool present_timing_verified;
+   bool present_timing_error_valid;
+   uint64_t present_timing_last_target_ns;
+   uint64_t present_timing_last_actual_ns;
+   uint64_t present_timing_last_interval_ns;
+   uint64_t present_timing_interval_avg_ns;
+   retro_time_t present_timing_stats_last_us;
+   int64_t present_timing_last_error_ns;
+   uint64_t present_timing_last_present_id;
    uint8_t *record_gpu_buffer;
 #ifdef HAVE_VIDEO_FILTER
    rarch_softfilter_t *state_filter;

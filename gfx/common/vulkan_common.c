@@ -485,6 +485,10 @@ static bool vulkan_load_instance_symbols(gfx_ctx_vulkan_data_t *vk)
    VULKAN_SYMBOL_WRAPPER_LOAD_INSTANCE_EXTENSION_SYMBOL(vk->context.instance, vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
    VULKAN_SYMBOL_WRAPPER_LOAD_INSTANCE_EXTENSION_SYMBOL(vk->context.instance, vkGetPhysicalDeviceSurfaceFormatsKHR);
    VULKAN_SYMBOL_WRAPPER_LOAD_INSTANCE_EXTENSION_SYMBOL(vk->context.instance, vkGetPhysicalDeviceSurfacePresentModesKHR);
+   vk->get_surface_capabilities2 =
+      (PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR)
+         vulkan_symbol_wrapper_instance_proc_addr()(vk->context.instance,
+            "vkGetPhysicalDeviceSurfaceCapabilities2KHR");
    return true;
 }
 
@@ -748,6 +752,9 @@ static const char *vulkan_optional_device_extensions[] = {
    /* Display timestamps for the presenter's repeat cadence; absent on
     * most Windows drivers, present on Android and Mesa. */
    "VK_GOOGLE_display_timing"
+#ifdef VK_EXT_present_timing
+   , "VK_EXT_present_timing"
+#endif
 #ifdef VULKAN_HDR_SWAPCHAIN
    /* Lets the app signal SMPTE-2086 mastering-display metadata to the
     * compositor via vkSetHdrMetadataEXT. Optional: if absent (common on
@@ -809,6 +816,9 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
    video_driver_state_t *video_st          = video_state_get_ptr();
 
    VkPhysicalDeviceFeatures features       = { false };
+#ifdef VK_EXT_present_timing
+   VkPhysicalDevicePresentTimingFeaturesEXT present_timing_features;
+#endif
 
    unsigned enabled_device_extension_count = 0;
 
@@ -833,6 +843,13 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
    device_info.enabledExtensionCount       = 0;
    device_info.ppEnabledExtensionNames     = NULL;
    device_info.pEnabledFeatures            = NULL;
+#ifdef VK_EXT_present_timing
+   present_timing_features.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT;
+   present_timing_features.pNext            = NULL;
+   present_timing_features.presentTiming    = VK_FALSE;
+   present_timing_features.presentAtAbsoluteTime = VK_FALSE;
+   present_timing_features.presentAtRelativeTime = VK_FALSE;
+#endif
 
    if (iface)
    {
@@ -1039,6 +1056,20 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
             break;
          }
       }
+#ifdef VK_EXT_present_timing
+      vk->present_timing_supported = false;
+      for (i = 0; i < enabled_device_extension_count; i++)
+      {
+         if (!strcmp(enabled_device_extensions[i], VK_EXT_PRESENT_TIMING_EXTENSION_NAME))
+         {
+            vk->present_timing_supported = true;
+            break;
+         }
+      }
+      video_st->present_timing_supported = vk->present_timing_supported;
+      RARCH_LOG("[Vulkan] VK_EXT_present_timing device extension: %s.\n",
+            vk->present_timing_supported ? "available" : "unavailable");
+#endif
 
 #ifdef VULKAN_HDR_SWAPCHAIN
       /* Note whether the extension was enabled; the actual entrypoint is
@@ -1063,6 +1094,15 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
       device_info.enabledExtensionCount   = enabled_device_extension_count;
       device_info.ppEnabledExtensionNames = enabled_device_extensions;
       device_info.pEnabledFeatures        = &features;
+#ifdef VK_EXT_present_timing
+      if (vk->present_timing_supported)
+      {
+         present_timing_features.presentTiming = VK_TRUE;
+         present_timing_features.presentAtAbsoluteTime = VK_TRUE;
+         present_timing_features.presentAtRelativeTime = VK_TRUE;
+         device_info.pNext = &present_timing_features;
+      }
+#endif
 
       if (cached_device_vk)
       {
@@ -1111,6 +1151,41 @@ static bool vulkan_context_init_device(gfx_ctx_vulkan_data_t *vk)
                "vkGetPastPresentationTimingGOOGLE");
 #endif
 
+#ifdef VK_EXT_present_timing
+   vk->present_timing_queue_size = NULL;
+   vk->present_timing_queue_capacity = 0;
+   vk->present_timing_pending = 0;
+   vk->get_timing_properties     = NULL;
+   vk->get_time_domains          = NULL;
+   vk->get_past_timing           = NULL;
+   if (vk->present_timing_supported)
+   {
+      vk->present_timing_queue_size =
+         (PFN_vkSetSwapchainPresentTimingQueueSizeEXT)vkGetDeviceProcAddr(
+               vk->context.device, "vkSetSwapchainPresentTimingQueueSizeEXT");
+      vk->get_timing_properties =
+         (PFN_vkGetSwapchainTimingPropertiesEXT)vkGetDeviceProcAddr(
+               vk->context.device, "vkGetSwapchainTimingPropertiesEXT");
+      vk->get_time_domains =
+         (PFN_vkGetSwapchainTimeDomainPropertiesEXT)vkGetDeviceProcAddr(
+               vk->context.device, "vkGetSwapchainTimeDomainPropertiesEXT");
+      vk->get_past_timing =
+         (PFN_vkGetPastPresentationTimingEXT)vkGetDeviceProcAddr(
+               vk->context.device, "vkGetPastPresentationTimingEXT");
+   }
+   if (vk->present_timing_supported
+         && (!vk->present_timing_queue_size
+            || !vk->get_time_domains || !vk->get_past_timing
+            || !vk->get_timing_properties))
+   {
+      RARCH_LOG("[Vulkan] VK_EXT_present_timing entry points incomplete; disabling.\n");
+      vk->present_timing_supported = false;
+      video_st->present_timing_supported = false;
+   }
+   else if (vk->present_timing_supported)
+      RARCH_LOG("[Vulkan] VK_EXT_present_timing entry points loaded.\n");
+#endif
+
 #ifdef VULKAN_HDR_SWAPCHAIN
    /* Now that the device exists, resolve vkSetHdrMetadataEXT if the
     * extension was enabled above. Stays NULL (call skipped) otherwise. */
@@ -1145,11 +1220,9 @@ static const char *vulkan_optional_instance_extensions[] = {
 #ifdef __APPLE__
    VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
 #endif
-#ifdef _WIN32
-   "VK_KHR_get_surface_capabilities2",
-#endif
+   "VK_KHR_get_surface_capabilities2"
 #ifdef VULKAN_HDR_SWAPCHAIN
-   VULKAN_COLORSPACE_EXTENSION_NAME
+   , VULKAN_COLORSPACE_EXTENSION_NAME
 #endif
 };
 
@@ -2334,6 +2407,135 @@ bool vulkan_is_hdr10_format(VkFormat format)
 }
 #endif /* VULKAN_HDR_SWAPCHAIN */
 
+#ifdef VK_EXT_present_timing
+static void vulkan_present_timing_query_surface(gfx_ctx_vulkan_data_t *vk)
+{
+   VkPhysicalDeviceSurfaceInfo2KHR surface_info;
+   VkSurfaceCapabilities2KHR capabilities;
+   VkPresentTimingSurfaceCapabilitiesEXT timing;
+   VkResult result;
+
+   vk->present_timing_surface_supported = false;
+   vk->present_timing_stage_queries = VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT;
+   if (!vk->get_surface_capabilities2)
+      return;
+
+   memset(&surface_info, 0, sizeof(surface_info));
+   surface_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR;
+   surface_info.surface = vk->vk_surface;
+   memset(&timing, 0, sizeof(timing));
+   timing.sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT;
+   memset(&capabilities, 0, sizeof(capabilities));
+   capabilities.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR;
+   capabilities.pNext = &timing;
+   result = vk->get_surface_capabilities2(vk->context.gpu,
+         &surface_info, &capabilities);
+   RARCH_LOG("[Vulkan] Present timing surface query: result %d, supported %s, stages 0x%x.\n",
+         (int)result, timing.presentTimingSupported ? "yes" : "no",
+         (unsigned)timing.presentStageQueries);
+   if (result == VK_SUCCESS && timing.presentTimingSupported)
+   {
+      vk->present_timing_surface_supported = true;
+      vk->present_timing_stage_queries = timing.presentStageQueries
+         | VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT;
+   }
+}
+
+static void vulkan_present_timing_calibrate(gfx_ctx_vulkan_data_t *vk)
+{
+   VkSwapchainTimeDomainPropertiesEXT props;
+   VkTimeDomainKHR *domains = NULL;
+   uint64_t *ids = NULL;
+   uint64_t count = 0;
+   uint32_t i;
+   VkTimeDomainKHR preferred_domain =
+#ifdef _WIN32
+      VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+      VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+
+   vk->present_timing_target_valid = false;
+   vk->present_timing_payload_logged = false;
+   vk->present_timing_calibrated = false;
+   vk->present_timing_last_verified = false;
+   vk->present_timing_last_present_id = 0;
+   vk->present_timing_last_target_time = 0;
+   vk->present_timing_last_actual_time = 0;
+   vk->present_timing_last_error_ns = 0;
+   vk->present_timing_time_domain = preferred_domain;
+   vk->present_timing_time_domain_id = 0;
+   vk->present_timing_relative = false;
+   RARCH_LOG("[Vulkan] Present timing calibration: preferred time domain %d.\n",
+         (int)preferred_domain);
+   {
+      video_driver_state_t *video_st = video_state_get_ptr();
+      video_st->present_timing_verified = false;
+      video_st->present_timing_error_valid = false;
+      video_st->present_timing_last_target_ns = 0;
+      video_st->present_timing_last_actual_ns = 0;
+      video_st->present_timing_last_interval_ns = 0;
+      video_st->present_timing_interval_avg_ns = 0;
+      video_st->present_timing_stats_last_us = 0;
+      video_st->present_timing_last_error_ns = 0;
+      video_st->present_timing_last_present_id = 0;
+   }
+   if (!vk->present_timing_supported
+         || !vk->present_timing_surface_supported
+         || !vk->get_time_domains
+         || vk->swapchain == VK_NULL_HANDLE)
+      return;
+
+   memset(&props, 0, sizeof(props));
+   props.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT;
+   {
+      VkResult res = vk->get_time_domains(vk->context.device, vk->swapchain,
+            &props, &count);
+      RARCH_LOG("[Vulkan] Present timing domains query: result %d, count %llu.\n",
+            (int)res, (unsigned long long)count);
+      if (res != VK_SUCCESS || !count)
+         return;
+   }
+
+   domains = (VkTimeDomainKHR*)calloc(count, sizeof(*domains));
+   ids     = (uint64_t*)calloc(count, sizeof(*ids));
+   if (!domains || !ids)
+      goto end;
+
+   props.timeDomainCount = count;
+   props.pTimeDomains    = domains;
+   props.pTimeDomainIds  = ids;
+   if (vk->get_time_domains(vk->context.device, vk->swapchain,
+            &props, &count) == VK_SUCCESS)
+   {
+      for (i = 0; i < count; i++)
+      {
+         RARCH_LOG("[Vulkan] Present timing domain[%u]: type %d, id %llu.\n",
+               i, (int)domains[i], (unsigned long long)ids[i]);
+         if (domains[i] == preferred_domain
+               || domains[i] == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT)
+         {
+            vk->present_timing_time_domain = domains[i];
+            vk->present_timing_time_domain_id = ids[i];
+            vk->present_timing_relative =
+                  domains[i] == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT;
+            vk->present_timing_calibrated = true;
+            RARCH_LOG("[Vulkan] Present timing calibrated to domain id %llu (%s).\n",
+                  (unsigned long long)ids[i],
+                  vk->present_timing_relative ? "relative" : "absolute");
+            break;
+         }
+      }
+   }
+
+end:
+   if (!vk->present_timing_calibrated)
+      RARCH_LOG("[Vulkan] Present timing calibration found no compatible time domain.\n");
+   free(domains);
+   free(ids);
+}
+#endif
+
 bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
       unsigned dims, int8_t swap_interval)
 {
@@ -2403,6 +2605,9 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
 
    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk->context.gpu,
          vk->vk_surface, &surface_properties);
+#ifdef VK_EXT_present_timing
+   vulkan_present_timing_query_surface(vk);
+#endif
 
    /* Skip creation when window is minimized */
    if (   !surface_properties.currentExtent.width
@@ -2941,6 +3146,11 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
    info.sType                  = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
    info.pNext                  = NULL;
    info.flags                  = 0;
+#ifdef VK_EXT_present_timing
+   if (vk->present_timing_supported
+         && vk->present_timing_surface_supported)
+      info.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+#endif
    info.surface                = vk->vk_surface;
    info.minImageCount          = desired_swapchain_images;
    info.imageFormat            = format.format;
@@ -3198,6 +3408,38 @@ bool vulkan_create_swapchain(gfx_ctx_vulkan_data_t *vk,
       meta.maxFrameAverageLightLevel = meta.maxLuminance;
       vk->set_hdr_metadata(vk->context.device, 1, &vk->swapchain, &meta);
    }
+#endif
+
+#ifdef VK_EXT_present_timing
+   if (vk->present_timing_queue_size
+         && vk->present_timing_surface_supported)
+   {
+      VkResult timing_queue_result = vk->present_timing_queue_size(
+            vk->context.device, vk->swapchain, 8);
+      if (timing_queue_result == VK_SUCCESS)
+         vk->present_timing_queue_capacity = 8;
+      RARCH_LOG("[Vulkan] Present timing queue setup: result %d.\n",
+            (int)timing_queue_result);
+   }
+   if (vk->get_timing_properties && vk->present_timing_surface_supported)
+   {
+      VkResult timing_properties_result;
+      memset(&vk->present_timing_properties, 0,
+            sizeof(vk->present_timing_properties));
+      vk->present_timing_properties.sType =
+            VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT;
+      timing_properties_result = vk->get_timing_properties(
+            vk->context.device, vk->swapchain,
+            &vk->present_timing_properties,
+            &vk->present_timing_properties_counter);
+      vk->present_timing_properties_valid =
+            timing_properties_result == VK_SUCCESS;
+      RARCH_LOG("[Vulkan] Present timing properties: result %d, refresh %llu ns, interval %llu ns.\n",
+            (int)timing_properties_result,
+            (unsigned long long)vk->present_timing_properties.refreshDuration,
+            (unsigned long long)vk->present_timing_properties.refreshInterval);
+   }
+   vulkan_present_timing_calibrate(vk);
 #endif
 
    return true;
@@ -3530,13 +3772,183 @@ retro_time_t vulkan_last_present_time(gfx_ctx_vulkan_data_t *vk)
    return (retro_time_t)(latest / 1000);
 }
 
+#ifdef VK_EXT_present_timing
+retro_time_t vulkan_present_timing_last_time(gfx_ctx_vulkan_data_t *vk)
+{
+   VkPastPresentationTimingInfoEXT query_info;
+   VkPastPresentationTimingPropertiesEXT props;
+   VkPastPresentationTimingEXT timings[8];
+   VkPresentStageTimeEXT stages[8][4];
+   uint32_t count = 8;
+   uint32_t i;
+   uint32_t j;
+   uint64_t latest = 0;
+   uint64_t latest_id = 0;
+   uint64_t latest_target = 0;
+   uint32_t completed = 0;
+   VkResult result;
+
+   if (!vk || !vk->present_timing_calibrated || !vk->get_past_timing
+         || vk->swapchain == VK_NULL_HANDLE)
+      return 0;
+
+   memset(&query_info, 0, sizeof(query_info));
+   query_info.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT;
+   query_info.flags = VK_PAST_PRESENTATION_TIMING_ALLOW_PARTIAL_RESULTS_BIT_EXT;
+   query_info.swapchain = vk->swapchain;
+
+   memset(&props, 0, sizeof(props));
+   props.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT;
+   props.presentationTimingCount = count;
+   props.pPresentationTimings = timings;
+   memset(timings, 0, sizeof(timings));
+   memset(stages, 0, sizeof(stages));
+   for (i = 0; i < count; i++)
+   {
+      timings[i].sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
+      timings[i].presentStageCount = 4;
+      timings[i].pPresentStages = stages[i];
+   }
+
+   result = vk->get_past_timing(vk->context.device, &query_info, &props);
+   if (result != VK_SUCCESS)
+      RARCH_LOG("[Vulkan] Present timing results: result %d, count %u.\n",
+            (int)result, props.presentationTimingCount);
+   else
+      RARCH_DBG("[Vulkan] Present timing results: result %d, count %u.\n",
+            (int)result, props.presentationTimingCount);
+   if (result != VK_SUCCESS && props.presentationTimingCount == 0)
+      return 0;
+
+   if (props.presentationTimingCount > count)
+      props.presentationTimingCount = count;
+   for (i = 0; i < props.presentationTimingCount; i++)
+   {
+      uint64_t present = 0;
+      RARCH_DBG("[Vulkan] Present timing record[%u]: id %llu domain %d/%llu stages %u.\n",
+            i, (unsigned long long)timings[i].presentId,
+            (int)timings[i].timeDomain,
+            (unsigned long long)timings[i].timeDomainId,
+            timings[i].presentStageCount);
+      if (timings[i].timeDomain != vk->present_timing_time_domain
+            || timings[i].timeDomainId != vk->present_timing_time_domain_id)
+         continue;
+      for (j = 0; j < timings[i].presentStageCount && j < 4; j++)
+      {
+         if (stages[i][j].time > present)
+            present = stages[i][j].time;
+      }
+      if (timings[i].reportComplete)
+         completed++;
+      if (present > latest)
+      {
+         latest        = present;
+         latest_id     = timings[i].presentId;
+         latest_target = timings[i].targetTime;
+      }
+   }
+   if (completed > vk->present_timing_pending)
+      vk->present_timing_pending = 0;
+   else
+      vk->present_timing_pending -= completed;
+   if (!latest)
+      RARCH_DBG("[Vulkan] Present timing query returned no compatible completed presentation.\n");
+   if (latest && (latest_id > vk->present_timing_last_present_id
+         || (latest_id == 0
+            && latest > vk->present_timing_last_actual_time)
+         || !vk->present_timing_last_verified))
+   {
+      RARCH_DBG("[Vulkan] Present timing newest result: id %llu target %llu actual %llu.\n",
+            (unsigned long long)latest_id,
+            (unsigned long long)latest_target,
+            (unsigned long long)latest);
+      vk->present_timing_last_present_id  = latest_id;
+      vk->present_timing_last_target_time = latest_target;
+      vk->present_timing_last_actual_time = latest;
+      {
+         video_driver_state_t *video_st = video_state_get_ptr();
+         video_st->present_timing_stats_last_us =
+               (retro_time_t)(latest / 1000);
+         video_st->present_timing_last_interval_ns =
+               video_st->present_timing_last_actual_ns > 0
+               && latest > video_st->present_timing_last_actual_ns
+            ? latest - video_st->present_timing_last_actual_ns : 0;
+         if (video_st->present_timing_last_interval_ns > 0)
+            video_st->present_timing_interval_avg_ns =
+               video_st->present_timing_interval_avg_ns
+               ? (video_st->present_timing_interval_avg_ns * 7
+                  + video_st->present_timing_last_interval_ns) / 8
+               : video_st->present_timing_last_interval_ns;
+      }
+      vk->present_timing_last_error_ns = vk->present_timing_relative
+         ? 0
+         : ((latest >= latest_target)
+            ? (int64_t)(latest - latest_target)
+            : -(int64_t)(latest_target - latest));
+      vk->present_timing_last_verified = true;
+      {
+         video_driver_state_t *video_st = video_state_get_ptr();
+         video_st->present_timing_verified = true;
+         video_st->present_timing_error_valid =
+               !vk->present_timing_relative;
+         video_st->present_timing_last_target_ns = latest_target;
+         video_st->present_timing_last_actual_ns = latest;
+         video_st->present_timing_last_error_ns =
+               vk->present_timing_last_error_ns;
+         video_st->present_timing_last_present_id = latest_id;
+      }
+      RARCH_DBG("[Vulkan] Present timing result: %s target=%llu actual=%llu error=%lld ns.\n",
+            vk->present_timing_relative ? "relative" : "absolute",
+            (unsigned long long)latest_target,
+            (unsigned long long)latest,
+            (long long)vk->present_timing_last_error_ns);
+   }
+   return (retro_time_t)(latest / 1000);
+}
+#endif
+
+#ifdef VK_EXT_present_timing
+static bool vulkan_present_timing_wait_for_slot(
+      gfx_ctx_vulkan_data_t *vk)
+{
+   unsigned tries;
+   uint64_t wait_ns = vk->present_timing_properties_valid
+      && vk->present_timing_properties.refreshDuration > 0
+      ? vk->present_timing_properties.refreshDuration : 1000000;
+
+   if (!vk->present_timing_queue_capacity
+         || vk->present_timing_pending
+            < vk->present_timing_queue_capacity)
+      return true;
+   for (tries = 0; tries < 100; tries++)
+   {
+      vulkan_present_timing_last_time(vk);
+      if (vk->present_timing_pending
+            < vk->present_timing_queue_capacity)
+         return true;
+      retro_sleep_until_us(cpu_features_get_time_usec()
+            + (retro_time_t)((wait_ns + 999) / 1000));
+   }
+   RARCH_LOG("[Vulkan] Present timing queue did not drain; skipping payload.\n");
+   return false;
+}
+#endif
+
 void vulkan_present(gfx_ctx_vulkan_data_t *vk, unsigned index)
 {
    VkPresentInfoKHR present;
    VkPresentTimesInfoGOOGLE times;
    VkPresentTimeGOOGLE ptime;
+#ifdef VK_EXT_present_timing
+   VkPresentTimingInfoEXT timing;
+   VkPresentTimingsInfoEXT timings;
+   bool timing_submitted = false;
+#endif
    VkResult result                 = VK_SUCCESS;
    VkResult err                    = VK_SUCCESS;
+#ifdef VK_EXT_present_timing
+   bool timing_allowed              = true;
+#endif
 
    present.sType                   = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
    present.pNext                   = NULL;
@@ -3546,6 +3958,26 @@ void vulkan_present(gfx_ctx_vulkan_data_t *vk, unsigned index)
    present.pSwapchains             = &vk->swapchain;
    present.pImageIndices           = &index;
    present.pResults                = &result;
+
+#ifdef VK_EXT_present_timing
+   if (vk->present_timing_calibrated
+         && vk->present_timing_queue_capacity
+         && vk->present_timing_pending
+            >= vk->present_timing_queue_capacity)
+      timing_allowed = vulkan_present_timing_wait_for_slot(vk);
+   if (!timing_allowed)
+      vk->present_timing_target_valid = false;
+
+   /* Every present gets a timing request. Shader sub-frames replace
+    * this immediate target with their scheduled deadline. */
+   if (timing_allowed && vk->present_timing_calibrated
+         && !vk->present_timing_target_valid)
+   {
+      vk->present_timing_target_time =
+            (uint64_t)cpu_features_get_time_usec() * 1000;
+      vk->present_timing_target_valid = true;
+   }
+#endif
 
    /* An ID per present, so the timing query below can name it. */
    if (vk->display_timing_supported && vk->display_timing_query)
@@ -3558,12 +3990,66 @@ void vulkan_present(gfx_ctx_vulkan_data_t *vk, unsigned index)
       ptime.desiredPresentTime   = 0;
       present.pNext              = &times;
    }
+#ifdef VK_EXT_present_timing
+   if (timing_allowed && vk->present_timing_target_valid)
+   {
+      timing.sType                   = VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT;
+      timing.pNext                   = present.pNext;
+      timing.flags                   = vk->present_timing_relative
+         ? VK_PRESENT_TIMING_INFO_PRESENT_AT_RELATIVE_TIME_BIT_EXT : 0;
+      if (vk->present_timing_relative)
+      {
+         uint64_t now = (uint64_t)cpu_features_get_time_usec() * 1000;
+         timing.targetTime = vk->present_timing_target_time > now
+            ? vk->present_timing_target_time - now : 0;
+      }
+      else
+         timing.targetTime = vk->present_timing_target_time;
+      timing.timeDomainId            = vk->present_timing_time_domain_id;
+      timing.presentStageQueries     = vk->present_timing_stage_queries;
+      timing.targetTimeDomainPresentStage =
+            (vk->present_timing_stage_queries
+               & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT)
+            ? VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT
+            : VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT;
+      timings.sType                  = VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT;
+      timings.pNext                  = NULL;
+      timings.swapchainCount         = 1;
+      timings.pTimingInfos           = &timing;
+      present.pNext                  = &timings;
+      timing_submitted               = true;
+      if (!vk->present_timing_payload_logged)
+      {
+         RARCH_LOG("[Vulkan] Present timing payload active: %s target %llu domain %llu, stages 0x%x.\n",
+               vk->present_timing_relative ? "relative" : "absolute",
+               (unsigned long long)timing.targetTime,
+               (unsigned long long)timing.timeDomainId,
+               (unsigned)timing.presentStageQueries);
+         vk->present_timing_payload_logged = true;
+      }
+      else
+         RARCH_DBG("[Vulkan] Present timing payload: %s target %llu domain %llu.\n",
+               vk->present_timing_relative ? "relative" : "absolute",
+               (unsigned long long)timing.targetTime,
+               (unsigned long long)timing.timeDomainId);
+   }
+#endif
 
    /* Better hope QueuePresent doesn't block D: */
 #ifdef HAVE_THREADS
    slock_lock(vk->context.queue_lock);
 #endif
    err = vkQueuePresentKHR(vk->context.queue, &present);
+#ifdef VK_EXT_present_timing
+   if (timing_submitted && err == VK_SUCCESS)
+      vk->present_timing_pending++;
+
+   /* The extension has a bounded timing-result queue. Drain it after
+    * every present, not only when the next paced frame is prepared. */
+   if (vk->present_timing_calibrated)
+      vulkan_present_timing_last_time(vk);
+   vk->present_timing_target_valid = false;
+#endif
    /* Queued whatever it returned: a failed present has still put its
     * semaphore wait on the queue, or may have, and the fence taken
     * before the next rebuild covers either. */

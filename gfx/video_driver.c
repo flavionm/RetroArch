@@ -6207,6 +6207,35 @@ VIDEO_NOINLINE static void video_driver_frame_statistics(
    video_info->osd_stat_params.color_hp    = NULL;
 
    {
+      retro_time_t present_us = 0;
+      double present_period_ms = video_st->present_timing_interval_avg_ns > 0
+         ? (double)video_st->present_timing_interval_avg_ns / 1000000.0 : 0.0;
+      double present_rate = present_period_ms > 0.0
+         ? 1000.0 / present_period_ms : 0.0;
+      if (!video_st->present_timing_verified
+            && video_st->poke
+            && video_st->poke->get_last_present_time)
+      {
+         present_us = video_st->poke->get_last_present_time(video_st->data);
+         if (present_us > video_st->present_timing_stats_last_us)
+         {
+            if (video_st->present_timing_stats_last_us > 0)
+            {
+               uint64_t interval_ns = (uint64_t)(present_us
+                     - video_st->present_timing_stats_last_us) * 1000;
+               video_st->present_timing_last_interval_ns = interval_ns;
+               video_st->present_timing_interval_avg_ns =
+                  video_st->present_timing_interval_avg_ns
+                  ? (video_st->present_timing_interval_avg_ns * 7
+                     + interval_ns) / 8 : interval_ns;
+               present_period_ms = (double)
+                     video_st->present_timing_interval_avg_ns / 1000000.0;
+               present_rate = present_period_ms > 0.0
+                  ? 1000.0 / present_period_ms : 0.0;
+            }
+            video_st->present_timing_stats_last_us = present_us;
+         }
+      }
       size_t __len = video_driver_stat_appendf(video_st->stat_text, 0,
             "CORE AV_INFO\n"
             " Size:       %ux%u\n"
@@ -6467,6 +6496,50 @@ VIDEO_NOINLINE static void video_driver_frame_statistics(
                   lat_max / 1000.0f);
       }
 #endif
+
+      if (video_st->present_timing_supported
+            && video_st->present_timing_verified)
+      {
+         if (video_st->present_timing_error_valid)
+            __len = video_driver_stat_appendf(video_st->stat_text, __len,
+                  "PRESENT TIMING\n"
+                  " Verified:   yes\n"
+                  " Mode:       absolute\n"
+                  " Present ID: %" PRIu64 "\n"
+                  " Target:     %" PRIu64 " ns\n"
+                  " Actual:     %" PRIu64 " ns\n"
+                  " Interval:   %7.3f ms (%7.3f fps)\n"
+                  " Error:      %+.3f ms\n",
+                  video_st->present_timing_last_present_id,
+                  video_st->present_timing_last_target_ns,
+                  video_st->present_timing_last_actual_ns,
+                  present_period_ms, present_rate,
+                  (double)video_st->present_timing_last_error_ns / 1000000.0);
+         else
+            __len = video_driver_stat_appendf(video_st->stat_text, __len,
+                  "PRESENT TIMING\n"
+                  " Verified:   yes\n"
+                  " Mode:       relative\n"
+                  " Present ID: %" PRIu64 "\n"
+                  " Target:     %" PRIu64 " ns duration\n"
+                  " Actual:     local-domain timestamp\n"
+                  " Interval:   %7.3f ms (%7.3f fps)\n",
+                  video_st->present_timing_last_present_id,
+                  video_st->present_timing_last_target_ns,
+                  present_period_ms, present_rate);
+      }
+      else if (video_st->present_timing_supported)
+         __len = video_driver_stat_appendf(video_st->stat_text, __len,
+               "PRESENT TIMING\n"
+               " Status:     waiting for measured results\n"
+               " Interval:   %7.3f ms (%7.3f fps)\n",
+               present_period_ms, present_rate);
+      else if (present_period_ms > 0.0)
+         __len = video_driver_stat_appendf(video_st->stat_text, __len,
+               "PRESENT TIMING\n"
+               " Source:     display fallback\n"
+               " Interval:   %7.3f ms (%7.3f fps)\n",
+               present_period_ms, present_rate);
 
       if (video_st->frame_delay_target > 0)
          __len = video_driver_stat_appendf(video_st->stat_text, __len,

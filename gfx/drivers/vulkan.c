@@ -8098,14 +8098,15 @@ static void vulkan_run_hdr_pipeline(VkPipeline pipeline, VkRenderPass render_pas
    vk->hdr.ubo_values.paper_white_nits    = prev_paper_white_nits;
 }
 
-static void vulkan_wait_shader_subframe(int64_t *deadline_ns,
-      int64_t period_ns)
+static bool vulkan_wait_shader_subframe(int64_t *deadline_ns,
+      int64_t period_ns, retro_time_t *margin)
 {
    retro_time_t now_us;
    int64_t now_ns;
+   retro_time_t period_us;
 
    if (period_ns <= 0)
-      return;
+      return false;
 
    now_us = cpu_features_get_time_usec();
    now_ns = (int64_t)now_us * 1000;
@@ -8115,8 +8116,49 @@ static void vulkan_wait_shader_subframe(int64_t *deadline_ns,
       *deadline_ns = now_ns;
 
    *deadline_ns += period_ns;
-   if (now_ns < *deadline_ns)
-      retro_sleep_until_us((retro_time_t)((*deadline_ns + 999) / 1000));
+   if (now_ns >= *deadline_ns)
+      return true;
+
+   /* Convert ns → µs with TRUNCATING division (like runloop_iterate).
+      Add 1 µs back so we never miss the deadline by rounding.          */
+   period_us = (retro_time_t)((period_ns / 1000) + 1);
+
+   if (margin[0] < period_us)
+   {
+      retro_time_t deadline_us = (retro_time_t)((*deadline_ns / 1000) + 1);
+      retro_time_t now = cpu_features_get_time_usec();
+
+      /* Sleep short of the deadline by the margin, so the remainder
+         can be spun to the exact deadline — matching runloop_iterate.  */
+      if (deadline_us - now > margin[0])
+      {
+         const retro_time_t asked_until = deadline_us - margin[0];
+         retro_sleep_until_us(asked_until);
+         now = cpu_features_get_time_usec();
+         margin[0] = runloop_pace_margin_update(margin[0],
+               now - asked_until, period_us);
+      }
+
+      /* Spin the remainder to the exact deadline.                    */
+      while (now < (retro_time_t)((*deadline_ns / 1000) + 1))
+      {
+         retro_cpu_relax();
+         now = cpu_features_get_time_usec();
+      }
+   }
+   else
+   {
+      /* Margin already ≥ period_us: spin only.                       */
+      const retro_time_t deadline_us = (retro_time_t)((*deadline_ns / 1000) + 1);
+      retro_time_t now = cpu_features_get_time_usec();
+      while (now < deadline_us)
+      {
+         retro_cpu_relax();
+         now = cpu_features_get_time_usec();
+      }
+   }
+
+   return true;
 }
 
 static bool vulkan_frame(void *data, const void *frame,
@@ -8133,6 +8175,7 @@ static bool vulkan_frame(void *data, const void *frame,
    VkCommandBufferBeginInfo begin_info;
    VkSemaphore signal_semaphores[2];
    int64_t shader_subframe_deadline_ns           = 0;
+   retro_time_t vulkan_shader_subframe_margin    = 0;
    retro_time_t start                            = cpu_features_get_time_usec();
    vk_t *vk                                      = (vk_t*)data;
    vulkan_filter_chain_t *filter_chain           = NULL;
@@ -9309,7 +9352,7 @@ static bool vulkan_frame(void *data, const void *frame,
       for (j = 1; j < (int) video_info->shader_subframes; j++)
       {
          vulkan_wait_shader_subframe(&shader_subframe_deadline_ns,
-+               video_info->shader_subframe_period_ns);
+               video_info->shader_subframe_period_ns, &vulkan_shader_subframe_margin);
          vulkan_filter_chain_set_shader_subframes(
                (vulkan_filter_chain_t*)filter_chain, video_info->shader_subframes);
          vulkan_filter_chain_set_current_shader_subframe(

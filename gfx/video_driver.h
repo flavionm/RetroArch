@@ -525,7 +525,9 @@ typedef struct video_frame_info
    unsigned custom_vp_dims;
    unsigned black_frame_insertion;
    unsigned bfi_dark_frames;
+   int64_t bfi_period_ns;
    unsigned shader_subframes;
+   int64_t shader_subframe_period_ns;
    unsigned current_subframe;
    unsigned fps_update_interval;
    unsigned memory_update_interval;

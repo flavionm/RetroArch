@@ -4837,7 +4837,19 @@ void video_driver_build_info(video_frame_info_t *video_info)
    video_info->crt_switch_hires_menu       = settings->bools.crt_switch_hires_menu;
    video_info->black_frame_insertion       = settings->uints.video_black_frame_insertion;
    video_info->bfi_dark_frames             = settings->uints.video_bfi_dark_frames;
+   video_info->bfi_period_ns                = 0;
+   if (video_st->av_info.timing.fps > 0.0
+         && video_info->black_frame_insertion > 0)
+      video_info->bfi_period_ns = (int64_t)(1000000000.0 /
+            (video_st->av_info.timing.fps
+             * (video_info->black_frame_insertion + 1)));
    video_info->shader_subframes            = settings->uints.video_shader_subframes;
+   video_info->shader_subframe_period_ns   = 0;
+   if (     settings->bools.vrr_runloop_enable
+         && video_info->shader_subframes > 1
+         && video_st->av_info.timing.fps > 0.0)
+      video_info->shader_subframe_period_ns = (int64_t)(1000000000.0 /
+            (video_st->av_info.timing.fps * video_info->shader_subframes));
    video_info->current_subframe            = 0;
 #ifdef HAVE_THREADS
    /* The video thread owns and stamps this under the wrapper. */
@@ -6208,6 +6220,11 @@ VIDEO_NOINLINE static void video_driver_frame_statistics(
 
    {
       retro_time_t present_us = 0;
+      double bfi_period_ms = 0.0;
+      double bfi_rate       = 0.0;
+      double shader_period_ms = 0.0;
+      double shader_rate       = 0.0;
+      double shader_deviation  = 0.0;
       double present_period_ms = video_st->present_timing_interval_avg_ns > 0
          ? (double)video_st->present_timing_interval_avg_ns / 1000000.0 : 0.0;
       double present_rate = present_period_ms > 0.0
@@ -6285,6 +6302,40 @@ VIDEO_NOINLINE static void video_driver_frame_statistics(
             100.0f * stddev,
             video_st->frame_count,
             video_st->frame_drop_count);
+
+      if (video_info->black_frame_insertion > 0
+            && video_info->bfi_period_ns > 0)
+      {
+         bfi_period_ms = (double)video_info->bfi_period_ns / 1000000.0;
+         bfi_rate = 1000.0 / bfi_period_ms;
+         __len = video_driver_stat_appendf(video_st->stat_text, __len,
+               "BFI\n"
+               " Presents:    %u\n"
+               " FrameTime:  %7.3f ms\n"
+               " FrameRate:  %7.3f fps\n",
+               video_info->black_frame_insertion + 1,
+               present_period_ms, present_rate);
+      }
+      if (video_info->shader_subframes > 1
+            && av_info->timing.fps > 0.0)
+      {
+         shader_period_ms = video_info->shader_subframe_period_ns > 0
+            ? (double)video_info->shader_subframe_period_ns / 1000000.0
+            : 1000.0 / (av_info->timing.fps
+                  * video_info->shader_subframes);
+         shader_rate = 1000.0 / shader_period_ms;
+         if (present_period_ms > 0.0)
+            shader_deviation = fabs(100.0
+                  * (present_period_ms - shader_period_ms)
+                  / shader_period_ms);
+         __len = video_driver_stat_appendf(video_st->stat_text, __len,
+               "SHADER SUB-FRAMES\n"
+               " Presents:  %u\n"
+               " FrameTime: %7.3f ms\n"
+               " FrameRate: %7.3f fps\n",
+               video_info->shader_subframes,
+               present_period_ms, present_rate);
+      }
 
 #ifdef HAVE_THREADS
       {

@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include <retro_assert.h>
+#include <features/features_cpu.h>
 #include <encodings/utf.h>
 #include <compat/strl.h>
 #include <gfx/scaler/scaler.h>
@@ -274,6 +275,8 @@ typedef struct vk
     * presents of it, then dark ones. present_last() replays that. */
    unsigned retained_light;
    unsigned retained_dark;
+   int64_t retained_present_period_ns;
+   uint64_t retained_next_target_ns;
    struct vk_image readback_image;
 #endif /* VULKAN_HDR_SWAPCHAIN */
 
@@ -7297,6 +7300,45 @@ static void vulkan_inject_black_frame(vk_t *vk, video_frame_info_t *video_info);
 
 /* Replays the group the retaining frame made: its light presents, then
  * its dark ones, so BFI keeps its strobe pattern through a repeat. */
+static void vulkan_prepare_retained_target(vk_t *vk)
+{
+#ifdef VK_EXT_present_timing
+   gfx_ctx_vulkan_data_t *ctx;
+   retro_time_t now_us;
+   int64_t now_ns;
+   int64_t period;
+
+   if (!vk || !vk->context)
+      return;
+   ctx = VULKAN_CTX_DATA_FROM_CONTEXT(vk->context);
+   if (!ctx->present_timing_calibrated)
+      return;
+
+   now_us = cpu_features_get_time_usec();
+   now_ns = (int64_t)now_us * 1000;
+   period = vk->retained_present_period_ns;
+   if (period <= 0)
+      vk->retained_next_target_ns = (uint64_t)now_ns;
+   else if (!vk->retained_next_target_ns)
+   {
+      retro_time_t actual_us = ctx->present_timing_relative
+         ? 0 : vulkan_present_timing_last_time(ctx);
+      int64_t base_ns = actual_us > 0
+         ? (int64_t)actual_us * 1000 : now_ns;
+      vk->retained_next_target_ns = (uint64_t)base_ns;
+      while ((int64_t)vk->retained_next_target_ns <= now_ns)
+         vk->retained_next_target_ns += (uint64_t)period;
+   }
+
+   ctx->present_timing_target_time = vk->retained_next_target_ns;
+   ctx->present_timing_target_valid = true;
+   if (period > 0)
+      vk->retained_next_target_ns += (uint64_t)period;
+#else
+   (void)vk;
+#endif
+}
+
 static unsigned vulkan_present_last(void *data)
 {
    unsigned i;
@@ -7308,6 +7350,7 @@ static unsigned vulkan_present_last(void *data)
 
    for (i = 0; i < vk->retained_light; i++)
    {
+      vulkan_prepare_retained_target(vk);
       if (!vulkan_present_retained_once(vk))
          return done;
       done++;
@@ -7316,6 +7359,7 @@ static unsigned vulkan_present_last(void *data)
    {
       if (!(vk->context->flags & VK_CTX_FLAG_HAS_ACQUIRED_SWAPCHAIN))
          return done;
+      vulkan_prepare_retained_target(vk);
       vulkan_inject_black_frame(vk, NULL);
       if (vk->ctx_driver->swap_buffers)
          vk->ctx_driver->swap_buffers(vk->ctx_data);
@@ -7933,6 +7977,60 @@ static void vulkan_run_hdr_pipeline(VkPipeline pipeline, VkRenderPass render_pas
    vk->hdr.ubo_values.paper_white_nits    = prev_paper_white_nits;
 }
 
+static void vulkan_wait_shader_subframe(vk_t *vk,
+      int64_t *deadline_ns, int64_t *observed_ns, int64_t period_ns)
+{
+   retro_time_t now_us;
+   int64_t now_ns;
+#ifdef VK_EXT_present_timing
+   gfx_ctx_vulkan_data_t *ctx =
+         VULKAN_CTX_DATA_FROM_CONTEXT(vk->context);
+   retro_time_t actual_us = 0;
+#endif
+
+   if (period_ns <= 0)
+      return;
+
+   now_us = cpu_features_get_time_usec();
+   now_ns = (int64_t)now_us * 1000;
+#ifdef VK_EXT_present_timing
+   if (ctx->present_timing_calibrated
+         && !ctx->present_timing_relative)
+      actual_us = vulkan_present_timing_last_time(ctx);
+   if (actual_us > 0 && (int64_t)actual_us * 1000 > *observed_ns)
+   {
+      *observed_ns = (int64_t)actual_us * 1000;
+      *deadline_ns = *observed_ns;
+      while (*deadline_ns <= now_ns)
+         *deadline_ns += period_ns;
+   }
+   else
+#endif
+   {
+      if (*deadline_ns <= 0 || now_ns - *deadline_ns >= period_ns)
+         *deadline_ns = now_ns;
+      *deadline_ns += period_ns;
+   }
+
+   {
+      int64_t lead_ns = period_ns / 4;
+      int64_t wait_until;
+      if (lead_ns < 500000)
+         lead_ns = 500000;
+      wait_until = *deadline_ns - lead_ns;
+      if (now_ns < wait_until)
+         retro_sleep_until_us((retro_time_t)((wait_until + 999) / 1000));
+   }
+
+#ifdef VK_EXT_present_timing
+   if (ctx->present_timing_calibrated)
+   {
+      ctx->present_timing_target_time = (uint64_t)*deadline_ns;
+      ctx->present_timing_target_valid = true;
+   }
+#endif
+}
+
 static bool vulkan_frame(void *data, const void *frame,
       unsigned dims,
       uint64_t frame_count,
@@ -7946,6 +8044,10 @@ static bool vulkan_frame(void *data, const void *frame,
    VkRenderPassBeginInfo rp_info;
    VkCommandBufferBeginInfo begin_info;
    VkSemaphore signal_semaphores[2];
+   int64_t bfi_deadline_ns                      = 0;
+   int64_t bfi_observed_ns                      = 0;
+   int64_t shader_subframe_deadline_ns           = 0;
+   int64_t shader_observed_ns                    = 0;
    vk_t *vk                                      = (vk_t*)data;
    vulkan_filter_chain_t *filter_chain           = NULL;
    bool waits_for_semaphores                     = false;
@@ -8778,6 +8880,13 @@ static bool vulkan_frame(void *data, const void *frame,
       vulkan_retain_backbuffer(vk, backbuffer);
       vk->retained_light = 1;
       vk->retained_dark  = 0;
+      vk->retained_present_period_ns = video_info->bfi_period_ns > 0
+         ? video_info->bfi_period_ns
+         : (video_info->shader_subframe_period_ns > 0
+            ? video_info->shader_subframe_period_ns
+            : (video_info->refresh_rate > 0.0f
+               ? (int64_t)(1000000000.0 / video_info->refresh_rate) : 0));
+      vk->retained_next_target_ns = 0;
    }
 
    if (    waits_for_semaphores
@@ -8993,8 +9102,11 @@ static bool vulkan_frame(void *data, const void *frame,
       if (bfi_light_frames > 0 && !(vk->context->flags & VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK))
       {
          vk->context->flags |= VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK;
+         bfi_deadline_ns = (int64_t)cpu_features_get_time_usec() * 1000;
          while (bfi_light_frames > 0)
          {
+            vulkan_wait_shader_subframe(vk, &bfi_deadline_ns,
+                  &bfi_observed_ns, video_info->bfi_period_ns);
             if (!(vulkan_frame(vk, NULL, 0, frame_count, 0, msg, video_info)))
             {
                vk->context->flags &= ~VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK;
@@ -9009,6 +9121,8 @@ static bool vulkan_frame(void *data, const void *frame,
       {
          if (!(vk->context->flags & VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK))
          {
+            vulkan_wait_shader_subframe(vk, &bfi_deadline_ns,
+                  &bfi_observed_ns, video_info->bfi_period_ns);
             vulkan_inject_black_frame(vk, video_info);
             if (vk->ctx_driver->swap_buffers)
                vk->ctx_driver->swap_buffers(vk->ctx_data);
@@ -9022,6 +9136,13 @@ static bool vulkan_frame(void *data, const void *frame,
          vk->retained_light = 1 + (video_info->black_frame_insertion
                - video_info->bfi_dark_frames);
          vk->retained_dark  = video_info->bfi_dark_frames;
+         vk->retained_present_period_ns = video_info->bfi_period_ns > 0
+            ? video_info->bfi_period_ns
+            : (video_info->shader_subframe_period_ns > 0
+               ? video_info->shader_subframe_period_ns
+               : (video_info->refresh_rate > 0.0f
+                  ? (int64_t)(1000000000.0 / video_info->refresh_rate) : 0));
+         vk->retained_next_target_ns = 0;
       }
    }
 
@@ -9041,8 +9162,12 @@ static bool vulkan_frame(void *data, const void *frame,
          &&  (!(vk->context->flags & VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK)))
    {
       vk->context->flags |= VK_CTX_FLAG_SWAP_INTERVAL_EMULATION_LOCK;
+      shader_subframe_deadline_ns =
+            (int64_t)cpu_features_get_time_usec() * 1000;
       for (j = 1; j < (int) video_info->shader_subframes; j++)
       {
+         vulkan_wait_shader_subframe(vk, &shader_subframe_deadline_ns,
+               &shader_observed_ns, video_info->shader_subframe_period_ns);
          vulkan_filter_chain_set_shader_subframes(
                (vulkan_filter_chain_t*)filter_chain, video_info->shader_subframes);
          vulkan_filter_chain_set_current_shader_subframe(
